@@ -1,104 +1,126 @@
+
 import os
-import logging
+import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes,
-    CallbackQueryHandler, MessageHandler, filters
-)
-from db import init_db, add_user, get_user, update_referrals, get_referral_count, save_wallet, get_wallet
-from web3_utils import send_tokens
-from languages import get_welcome_message, get_lang_keyboard
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext, MessageHandler, filters
+from web3 import Web3
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = "@benjaminfranklintoken"
+TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+CHAIN_RPC = os.getenv("CHAIN_RPC")
 
-logging.basicConfig(level=logging.INFO)
+w3 = Web3(Web3.HTTPProvider(CHAIN_RPC))
+contract_abi = [
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "_to", "type": "address"},
+            {"name": "_value", "type": "uint256"}
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "type": "function"
+    }
+]
+contract = w3.eth.contract(address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=contract_abi)
 
-# استارت ربات
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+conn = sqlite3.connect("users.db", check_same_thread=False)
+c = conn.cursor()
+c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, wallet TEXT, invited_by INTEGER, rewarded INTEGER DEFAULT 0)")
+conn.commit()
+
+def send_tokens(to_address, amount):
+    nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(WALLET_ADDRESS))
+    tx = contract.functions.transfer(Web3.to_checksum_address(to_address), amount).build_transaction({
+        'chainId': 56,
+        'gas': 200000,
+        'gasPrice': w3.to_wei('5', 'gwei'),
+        'nonce': nonce,
+    })
+    signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    return tx_hash.hex()
+
+async def start(update: Update, context: CallbackContext.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
     args = context.args
-    referrer_id = args[0] if args else None
 
-    if not get_user(user.id):
-        add_user(user.id, user.username, referrer_id)
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    if not c.fetchone():
+        invited_by = int(args[0]) if args else None
+        c.execute("INSERT INTO users (user_id, invited_by) VALUES (?, ?)", (user_id, invited_by))
+        conn.commit()
 
-    chat_member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
-    if chat_member.status in ['left', 'kicked']:
-        await update.message.reply_text(
-            '🔐 لطفاً ابتدا در کانال عضو شوید و سپس /start را بزنید.
+    c.execute("SELECT wallet FROM users WHERE user_id = ?", (user_id,))
+    wallet = c.fetchone()[0]
 
-📢 @benjaminfranklintoken'
-        )
-        return
-
-    if get_user(user.id)['rewarded'] == 0:
-        await update.message.reply_text("💼 لطفاً آدرس کیف پول BSC خود را ارسال کنید تا پاداش دریافت کنید:")
-        return
-
-    keyboard = get_lang_keyboard(user.id)
-    await update.message.reply_text('🌐 Choose Language:', reply_markup=keyboard)
-
-# ذخیره آدرس والت
-async def wallet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    wallet = update.message.text.strip()
-
-    if not wallet.startswith("0x") or len(wallet) != 42:
-        await update.message.reply_text("❌ آدرس معتبر BSC نیست. لطفاً دوباره ارسال کنید.")
-        return
-
-    save_wallet(user.id, wallet)
-
-    if get_user(user.id)['rewarded'] == 0:
-        tx = send_tokens(wallet, amount=500)
-        if tx:
-            update_referrals(user.id, rewarded=True)
-            referrer = get_user(user.id)['referrer_id']
-            if referrer:
-                ref_wallet = get_wallet(referrer)
-                if ref_wallet:
-                    send_tokens(ref_wallet, amount=100)
-                    update_referrals(referrer)
-        await update.message.reply_text("🎉 پاداش شما ارسال شد! لطفاً چند دقیقه منتظر تایید تراکنش باشید.")
+    if not wallet:
+        await update.message.reply_text("👛 لطفاً آدرس کیف پول BSC خود را وارد کنید:")
     else:
-        await update.message.reply_text("✅ آدرس شما ثبت شد.")
+        ref_link = f"https://t.me/benjaminfranklintoken_bot?start={user_id}"
+        await update.message.reply_text(f"🎉 شما قبلاً ثبت‌نام کرده‌اید.
 
-# انتخاب زبان
-async def lang_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    lang = query.data
-    user_id = query.from_user.id
-    msg = get_welcome_message(lang, user_id)
-    await query.answer()
-    await query.edit_message_text(msg)
+🔗 لینک دعوت شما:
+{ref_link}")
 
-# لینک دعوت اختصاصی
-async def myref(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    bot_username = (await context.bot.get_me()).username
-    ref_link = f"https://t.me/{bot_username}?start={user.id}"
-    count = get_referral_count(user.id)
-    await update.message.reply_text(
-        f"🔗 لینک دعوت شما:
-{ref_link}
+async def handle_wallet(update: Update, context: CallbackContext.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
 
-👥 تعداد دعوت‌های معتبر: {count}"
-    )
+    if not w3.is_address(text):
+        await update.message.reply_text("❌ آدرس کیف پول معتبر نیست.")
+        return
 
-# اجرای ربات
-def main():
-    init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myref", myref))
-    app.add_handler(CallbackQueryHandler(lang_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_handler))
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-        webhook_url=os.environ.get("WEBHOOK_URL")
-    )
+    c.execute("SELECT rewarded FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        await update.message.reply_text("لطفاً ابتدا /start را بزنید.")
+        return
+
+    rewarded = row[0]
+    c.execute("UPDATE users SET wallet = ? WHERE user_id = ?", (text, user_id))
+    conn.commit()
+
+    if rewarded == 0:
+        try:
+            send_tokens(text, 500 * (10 ** 18))
+            c.execute("UPDATE users SET rewarded = 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            await update.message.reply_text("✅ ۵۰۰ توکن BJF به کیف پول شما ارسال شد.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا در ارسال توکن: {e}")
+            return
+
+        # پاداش به معرف
+        c.execute("SELECT invited_by FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        if row and row[0]:
+            inviter = row[0]
+            c.execute("SELECT wallet FROM users WHERE user_id = ?", (inviter,))
+            inviter_wallet = c.fetchone()
+            if inviter_wallet and inviter_wallet[0]:
+                try:
+                    send_tokens(inviter_wallet[0], 100 * (10 ** 18))
+                    await update.message.reply_text("🎁 معرف شما ۱۰۰ توکن BJF دریافت کرد.")
+                except:
+                    pass
+
+    ref_link = f"https://t.me/benjaminfranklintoken_bot?start={user_id}"
+    await update.message.reply_text(f"🔗 لینک دعوت شما:
+{ref_link}")
 
 if __name__ == "__main__":
-    main()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_wallet))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
+    )
